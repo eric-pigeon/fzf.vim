@@ -1,3 +1,4 @@
+" vim: foldmethod=marker
 " Copyright (c) 2017 Junegunn Choi
 "
 " MIT License
@@ -29,6 +30,7 @@ set cpo&vim
 " ------------------------------------------------------------------
 
 let s:min_version = '0.23.0'
+" Common {{{
 let s:is_win = has('win32') || has('win64')
 let s:layout_keys = ['window', 'up', 'down', 'left', 'right']
 let s:bin_dir = expand('<sfile>:p:h:h:h').'/bin/'
@@ -84,6 +86,52 @@ function! s:check_requirements()
   end
   throw printf('You need to upgrade fzf. Found: %s (%s). Required: %s or above.', fzf_version, exec, s:min_version)
 endfunction
+
+if s:is_win
+  let s:term_marker = '&::FZF'
+
+  function! s:fzf_call(fn, ...)
+    let shellslash = &shellslash
+    try
+      set noshellslash
+      return call(a:fn, a:000)
+    finally
+      let &shellslash = shellslash
+    endtry
+  endfunction
+
+  " Use utf-8 for fzf.vim commands
+  " Return array of shell commands for cmd.exe
+  function! s:wrap_cmds(cmds)
+    return map(['@echo off', 'for /f "tokens=4" %%a in (''chcp'') do set origchcp=%%a', 'chcp 65001 > nul'] +
+          \ (type(a:cmds) == type([]) ? a:cmds : [a:cmds]) +
+          \ ['chcp %origchcp% > nul'], 'v:val."\r"')
+  endfunction
+else
+  let s:term_marker = ";#FZF"
+
+  function! s:fzf_call(fn, ...)
+    return call(a:fn, a:000)
+  endfunction
+
+  function! s:wrap_cmds(cmds)
+    return a:cmds
+  endfunction
+endif
+
+
+" FUNCTION: s:slash() {{{
+" return the path separator used by the underlying file system.  special
+" consideration is taken for the use of the 'shellslash' option on windows
+" systems.
+function! s:slash()
+  if !s:is_win || (exists('+shellslash') && &shellslash)
+    return '/'
+  else
+    return '\'
+  endif
+endfunction
+" }}}
 
 function! s:extend_opts(dict, eopts, prepend)
   if empty(a:eopts)
@@ -219,6 +267,18 @@ function! s:wrap(name, opts, bang)
   endif
   return wrapped
 endfunction
+
+
+" TODO - kinda copy of fzf#wrap
+function! s:wrap2(args)
+  let opts = copy(a:args)
+
+  if exists('g:fzf_layout')
+    let opts = extend(opts, s:validate_layout(get(g:, 'fzf_layout', s:default_layout)))
+  endif
+  return opts
+endfunction
+
 
 function! s:strip(str)
   return substitute(a:str, '^\s*\|\s*$', '', 'g')
@@ -372,9 +432,51 @@ function! fzf#vim#_uniq(list)
   return ret
 endfunction
 
-" ------------------------------------------------------------------
-" Files
-" ------------------------------------------------------------------
+function! s:fzf_expand(fmt)
+  return s:fzf_call('expand', a:fmt, 1)
+endfunction
+
+function! s:common_sink(action, lines) abort
+  if len(a:lines) < 2
+    return
+  endif
+  let key = remove(a:lines, 0)
+  let Cmd = get(a:action, key, 'e')
+  if type(Cmd) == type(function('call'))
+    return Cmd(a:lines)
+  endif
+  if len(a:lines) > 1
+    augroup fzf_swap
+      autocmd SwapExists * let v:swapchoice='o'
+            \| call s:warn('fzf: E325: swap file exists: '.s:fzf_expand('<afile>'))
+    augroup END
+  endif
+  try
+    let empty = empty(s:fzf_expand('%')) && line('$') == 1 && empty(getline(1)) && !&modified
+    let autochdir = &autochdir
+    set noautochdir
+
+    for item in a:lines
+      if empty
+        execute 'e' s:escape(item)
+        let empty = 0
+      else
+        call s:open(Cmd, item)
+      endif
+      if !has('patch-8.0.0177') && !has('nvim-0.2') && exists('#BufEnter')
+            \ && isdirectory(item)
+        doautocmd BufEnter
+      endif
+    endfor
+  catch /^Vim:Interrupt$/
+  finally
+    let &autochdir = autochdir
+    silent! autocmd! fzf_swap
+  endtry
+endfunction
+" }}}
+
+" Files {{{
 function! s:shortpath()
   let short = fnamemodify(getcwd(), ':~:.')
   if !has('win32unix')
@@ -383,6 +485,41 @@ function! s:shortpath()
   let slash = (s:is_win && !&shellslash) ? '\' : '/'
   return empty(short) ? '~'.slash : short . (short =~ escape(slash, '\').'$' ? '' : slash)
 endfunction
+
+" TODO
+let s:default_layout = { 'down': '~40%' }
+
+function! s:validate_layout(layout)
+  for key in keys(a:layout)
+    if index(s:layout_keys, key) < 0
+      throw printf('Invalid entry in g:fzf_layout: %s (allowed: %s)%s',
+            \ key, join(s:layout_keys, ', '), key == 'options' ? '. Use $FZF_DEFAULT_OPTS.' : '')
+    endif
+  endfor
+  return a:layout
+endfunction
+
+let s:wildignore = ['"*/tmp/*"', '"*.so"', '"*.swp"', '"*.zip"', '"*.class"',
+      \ '"tags"', '"*.jpg"', '"*.ttf"', '"*.TTF"', '"*.png"', '"*/target/*"',
+      \ '".git"', '".svn"', '".hg"', '".DS_Store"', '"*.svg"']
+let s:fzf_file_source  = 'ag --nocolor --nogroup --ignore ' . join(s:wildignore, ' --ignore ') . ' -g ""'
+
+function! s:delete_file(lines)
+  for file in a:lines
+    echom file
+    echom type(file)
+    let success = delete(file)
+    if success != 0
+      echom "could not delete file"
+    endif
+  endfor
+endfunction
+
+let s:files_default_action = {
+  \ 'ctrl-t': 'tab split',
+  \ 'ctrl-x': 'split',
+  \ 'ctrl-v': 'vsplit',
+  \ 'ctrl-d': function('s:delete_file') }
 
 function! fzf#vim#files(dir, ...)
   let args = {}
@@ -397,14 +534,120 @@ function! fzf#vim#files(dir, ...)
     let dir = s:shortpath()
   endif
 
+  " TODO
   let args.options = ['-m', '--prompt', strwidth(dir) < &columns / 2 - 20 ? dir : '> ']
+  let args.source = s:fzf_file_source
   call s:merge_opts(args, get(g:, 'fzf_files_options', []))
-  return s:fzf('files', args, a:000)
+
+  let args._action = get(g:, 'fzf_files_action', s:files_default_action)
+  call add(args.options, '--expect='.join(keys(args._action), ','))
+  function! args.sink(lines) abort
+    return s:common_sink(self._action, a:lines)
+  endfunction
+  let args['sink*'] = remove(args, 'sink')
+  " call s:merge_opts(args, {'name': 'files'})
+  return fzf#run(s:wrap2(args))
+endfunction
+" }}}
+
+" Directories {{{
+
+" FUNCTION: s:create_parent_directories(path) {{{
+"
+" create parent directories for this path if needed
+" without throwing any errors if those directories already exist
+"
+" Args:
+" path: full path of the node whose parent directories may need to be created
+function! s:create_parent_directories(path)
+    let dir_path = fnamemodify(a:path, ':h')
+    if !isdirectory(dir_path)
+        call mkdir(dir_path, 'p')
+    endif
+endfunction
+" }}}
+
+" FUNCTION: s:create_path(fullpath) {{{
+"
+" Factory method.
+"
+" Creates a path object with the given path. The path is also created on the
+" filesystem. If the path already exists, a exception is thrown.
+"
+" Args:
+" fullpath: the full filesystem path to the file/dir to create
+function! s:create_path(fullpath)
+  "bail if the a:fullpath already exists
+  if isdirectory(a:fullpath) || filereadable(a:fullpath)
+    " TODO
+    throw "Directory Exists: '" . a:fullpath . "'"
+  endif
+
+  try
+    "if it ends with a slash, assume its a dir create it
+    if a:fullpath =~# '\(\\\|\/\)$'
+      "whack the trailing slash off the end if it exists
+      let fullpath = substitute(a:fullpath, '\(\\\|\/\)$', '', '')
+
+      call mkdir(fullpath, 'p')
+
+    "assume its a file and create
+    else
+      call s:create_parent_directories(a:fullpath)
+      call writefile([], a:fullpath)
+    endif
+  catch
+    throw "Could not create path: '" . a:fullpath . "'"
+  endtry
+endfunction
+" }}}
+
+function! s:add_file(lines)
+  let line = a:lines[0]
+  let title = "Add a childnode"
+  let info = "Enter the dir/file name to be created. Dirs end with a '/'"
+  let minimal = "Add node:"
+  let divider = "=========================================================="
+  let prompt =  title . "\n" . divider . "\n" . info . "\n"
+  let new_node_name = input(prompt, line . s:slash(), "file")
+  let new_path = s:create_path(new_node_name)
 endfunction
 
-" ------------------------------------------------------------------
-" Lines
-" ------------------------------------------------------------------
+function! s:delete_directory(lines)
+  " TODO
+endfunction
+
+let s:directories_default_action = {
+  \ 'ctrl-a': function('s:add_file'),
+  \ 'ctrl-d': function('s:delete_directory') }
+
+function! fzf#vim#directories(dir, ...)
+  let args = {}
+  if !empty(a:dir)
+    if !isdirectory(expand(a:dir))
+      return s:warn('Invalid directory')
+    endif
+    let slash = (s:is_win && !&shellslash) ? '\\' : '/'
+    let dir = substitute(a:dir, '[/\\]*$', slash, '')
+    let args.dir = dir
+  else
+    let dir = s:shortpath()
+  endif
+
+  let args.options = ['-m', '--prompt', strwidth(dir) < &columns / 2 - 20 ? dir : '> ']
+  call s:merge_opts(args, get(g:, 'fzf_directies_options', []))
+  let args.source = 'find ${1:-.} -path ''*/\.*'' -prune -o -type d -print 2> /dev/null'
+  let args._action = get(g:, 'fzf_directies_action', s:directories_default_action)
+  call add(args.options, '--expect='.join(keys(args._action), ','))
+  function! args.sink(lines) abort
+    return s:common_sink(self._action, a:lines)
+  endfunction
+  let args['sink*'] = remove(args, 'sink')
+  return s:fzf('directories', args, a:000)
+endfunction
+" }}}
+
+" Lines {{{
 function! s:line_handler(lines)
   if len(a:lines) < 2
     return
@@ -471,10 +714,9 @@ function! fzf#vim#lines(...)
   \ 'options': s:reverse_list(['+m', '--tiebreak=index', '--prompt', 'Lines> ', '--ansi', '--extended', '--nth='.nth.'..', '--tabstop=1', '--query', query])
   \}, args)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" BLines
-" ------------------------------------------------------------------
+" BLines {{{
 function! s:buffer_line_handler(lines)
   if len(a:lines) < 2
     return
@@ -516,9 +758,9 @@ function! fzf#vim#buffer_lines(...)
   \ 'options': s:reverse_list(['+m', '--tiebreak=index', '--multi', '--prompt', 'BLines> ', '--ansi', '--extended', '--nth=2..', '--tabstop=1'])
   \}, args)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" Colors
+" Colors {{{
 " ------------------------------------------------------------------
 function! fzf#vim#colors(...)
   let colors = split(globpath(&rtp, "colors/*.vim"), "\n")
@@ -531,16 +773,16 @@ function! fzf#vim#colors(...)
   \ 'options': '+m --prompt="Colors> "'
   \}, a:000)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" Locate
-" ------------------------------------------------------------------
+" Locate {{{
 function! fzf#vim#locate(query, ...)
   return s:fzf('locate', {
   \ 'source':  'locate '.a:query,
   \ 'options': '-m --prompt "Locate> "'
   \}, a:000)
 endfunction
+" }}}
 
 " ------------------------------------------------------------------
 " History[:/]
@@ -614,11 +856,9 @@ function! fzf#vim#history(...)
   \ 'options': ['-m', '--header-lines', !empty(expand('%')), '--prompt', 'Hist> ']
   \}, a:000)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" GFiles[?]
-" ------------------------------------------------------------------
-
+" GFiles[?] {{{
 function! s:get_git_root()
   let root = split(system('git rev-parse --show-toplevel'), '\n')[0]
   return v:shell_error ? '' : root
@@ -660,10 +900,9 @@ function! fzf#vim#gitfiles(args, ...)
   let wrapped['sink*'] = remove(wrapped, 'newsink')
   return s:fzf('gfiles-diff', wrapped, a:000)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" Buffers
-" ------------------------------------------------------------------
+" Buffers {{{
 function! s:find_open_window(b)
   let [tcur, tcnt] = [tabpagenr() - 1, tabpagenr('$')]
   for toff in range(0, tabpagenr('$') - 1)
@@ -738,6 +977,7 @@ function! fzf#vim#buffers(...)
   \ 'options': ['+m', '-x', '--tiebreak=index', header_lines, '--ansi', '-d', '\t', '--with-nth', '3..', '-n', '2,1..2', '--prompt', 'Buf> ', '--query', query, '--preview-window', '+{2}-/2', '--tabstop', tabstop]
   \}, args)
 endfunction
+" }}}
 
 " ------------------------------------------------------------------
 " Ag / Rg
@@ -826,10 +1066,9 @@ function! fzf#vim#grep(grep_command, has_column, ...)
     let $FZF_DEFAULT_COMMAND = prev_default_command
   endtry
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" BTags
-" ------------------------------------------------------------------
+" BTags {{{
 function! s:btags_source(tag_cmds)
   if !filereadable(expand('%'))
     throw 'Save the file first'
@@ -888,10 +1127,9 @@ function! fzf#vim#buffer_tags(query, ...)
     return s:warn(v:exception)
   endtry
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" Tags
-" ------------------------------------------------------------------
+" Tags {{{
 function! s:tags_sink(lines)
   if len(a:lines) < 2
     return
@@ -961,10 +1199,9 @@ function! fzf#vim#tags(query, ...)
   \ 'sink*':   s:function('s:tags_sink'),
   \ 'options': extend(opts, ['--nth', '1..2', '-m', '-d', '\t', '--tiebreak=begin', '--prompt', 'Tags> ', '--query', a:query])}, a:000)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" Snippets (UltiSnips)
-" ------------------------------------------------------------------
+" Snippets (UltiSnips) {{{
 function! s:inject_snippet(line)
   let snip = split(a:line, "\t")[0]
   execute 'normal! a'.s:strip(snip)."\<c-r>=UltiSnips#ExpandSnippet()\<cr>"
@@ -985,10 +1222,9 @@ function! fzf#vim#snippets(...)
   \ 'options': '--ansi --tiebreak=index +m -n 1,.. -d "\t"',
   \ 'sink':    s:function('s:inject_snippet')}, a:000)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" Commands
-" ------------------------------------------------------------------
+" Commands {{{
 let s:nbs = nr2char(0x2007)
 
 function! s:format_cmd(line)
@@ -1053,10 +1289,9 @@ function! fzf#vim#commands(...)
   \ 'options': '--ansi --expect '.get(g:, 'fzf_commands_expect', 'ctrl-x').
   \            ' --tiebreak=index --header-lines 1 -x --prompt "Commands> " -n2,3,2..3 -d'.s:nbs}, a:000)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" Marks
-" ------------------------------------------------------------------
+" Marks {{{
 function! s:format_mark(line)
   return substitute(a:line, '\S', '\=s:yellow(submatch(0), "Number")', '')
 endfunction
@@ -1082,10 +1317,9 @@ function! fzf#vim#marks(...)
   \ 'sink*':   s:function('s:mark_sink'),
   \ 'options': '+m -x --ansi --tiebreak=index --header-lines 1 --tiebreak=begin --prompt "Marks> "'}, a:000)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" Help tags
-" ------------------------------------------------------------------
+" Help tags {{{
 function! s:helptag_sink(line)
   let [tag, file, path] = split(a:line, "\t")[0:2]
   let rtp = fnamemodify(path, ':p:h:h')
@@ -1113,10 +1347,9 @@ function! fzf#vim#helptags(...)
   \ 'sink':    s:function('s:helptag_sink'),
   \ 'options': ['--ansi', '+m', '--tiebreak=begin', '--with-nth', '..-2']}, a:000)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" File types
-" ------------------------------------------------------------------
+" File types {{{
 function! fzf#vim#filetypes(...)
   return s:fzf('filetypes', {
   \ 'source':  fzf#vim#_uniq(sort(map(split(globpath(&rtp, 'syntax/*.vim'), '\n'),
@@ -1125,10 +1358,9 @@ function! fzf#vim#filetypes(...)
   \ 'options': '+m --prompt="File types> "'
   \}, a:000)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" Windows
-" ------------------------------------------------------------------
+" Windows {{{
 function! s:format_win(tab, win, buf)
   let modified = getbufvar(a:buf, '&modified')
   let name = bufname(a:buf)
@@ -1159,10 +1391,9 @@ function! fzf#vim#windows(...)
   \ 'sink':    s:function('s:windows_sink'),
   \ 'options': '+m --ansi --tiebreak=begin --header-lines=1'}, a:000)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" Commits / BCommits
-" ------------------------------------------------------------------
+" Commits / BCommits {{{
 function! s:yank_to_register(data)
   let @" = a:data
   silent! let @* = a:data
@@ -1281,10 +1512,9 @@ function! fzf#vim#buffer_commits(...) range
   endif
   return s:commits(s:given_range(a:firstline, a:lastline), 1, a:000)
 endfunction
+" }}}
 
-" ------------------------------------------------------------------
-" fzf#vim#maps(mode, opts[with count and op])
-" ------------------------------------------------------------------
+" fzf#vim#maps(mode, opts[with count and op]) {{{
 function! s:align_pairs(list)
   let maxlen = 0
   let pairs = []
@@ -1347,10 +1577,9 @@ function! fzf#vim#maps(mode, ...)
   \ 'sink':    s:function('s:key_sink'),
   \ 'options': '--prompt "Maps ('.a:mode.')> " --ansi --no-hscroll --nth 1,.. --color prompt:'.pcolor}, a:000)
 endfunction
+" }}}
 
-" ----------------------------------------------------------------------------
-" fzf#vim#complete - completion helper
-" ----------------------------------------------------------------------------
+" fzf#vim#complete - completion helper {{{
 inoremap <silent> <Plug>(-fzf-complete-trigger) <c-o>:call <sid>complete_trigger()<cr>
 
 function! s:pluck(dict, key, default)
@@ -1458,6 +1687,7 @@ function! fzf#vim#complete(...)
   call feedkeys("\<Plug>(-fzf-complete-trigger)")
   return ''
 endfunction
+" }}}
 
 " ------------------------------------------------------------------
 let &cpo = s:cpo_save
